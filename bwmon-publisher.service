@@ -1,0 +1,55 @@
+[Unit]
+Description=Bandwidth Monitor Publisher
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bwmon-publisher.sh
+Restart=always
+User=root
+
+# 1. Filesystem Isolation
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run
+
+# 2. Kernel & System Protections
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+
+# 3. Execution Boundaries
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+
+# 4. Capability Bounding (Whitelist)
+# Drop all capabilities except the one required to switch network namespaces
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=
+
+# 5. Address Family Restriction
+# ip netns uses Netlink to talk to the kernel, and UNIX for local IPC.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+# 6. System Call Architecture & Filtering (Seccomp)
+SystemCallArchitectures=native
+# We must allow @mount because 'ip netns' bind-mounts configuration files.
+SystemCallFilter=~@clock @cpu-emulation @debug @module @obsolete @privileged @raw-io @reboot @swap @resources
+
+# 7. Miscellaneous
+UMask=0022
+DevicePolicy=closed
+ProtectKernelLogs=yes
+PrivateDevices=yes
+IPAddressDeny=any
+ProtectProc=invisible
+RestrictNamespaces=mnt net
+
+[Install]
+WantedBy=multi-user.target
