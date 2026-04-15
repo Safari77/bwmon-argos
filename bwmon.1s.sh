@@ -38,11 +38,11 @@ format_speed() {
 }
 
 # Load all previous states into memory at once
-declare -A PREV_RX_MAP PREV_TX_MAP
+declare -A PREV_MAP
 if [[ -r "$STATE_FILE" ]]; then
-  while read -r p_netns p_device p_rx p_tx; do
-    PREV_RX_MAP["${p_netns}_${p_device}"]=$p_rx
-    PREV_TX_MAP["${p_netns}_${p_device}"]=$p_tx
+  # State format: netns device rx1 tx1 rx2 tx2 rx3 tx3
+  while read -r p_netns p_device p_hist; do
+    PREV_MAP["${p_netns}_${p_device}"]="$p_hist"
   done < "$STATE_FILE"
 fi
 
@@ -57,27 +57,54 @@ while read -r netns device RX TX; do
 
   KEY="${netns}_${device}"
 
-  # Retrieve previous state from memory, default to 0
-  PREV_RX=${PREV_RX_MAP[$KEY]:-0}
-  PREV_TX=${PREV_TX_MAP[$KEY]:-0}
+  # Retrieve previous state from memory
+  # p_hist contains: rx1 tx1 rx2 tx2 rx3 tx3 (1 is 1 sec ago, 2 is 2 secs ago...)
+  read -r p_rx1 p_tx1 p_rx2 p_tx2 p_rx3 p_tx3 <<< "${PREV_MAP[$KEY]}"
 
-  # Calculate Speeds
-  RX_DIFF=$((RX - PREV_RX))
-  TX_DIFF=$((TX - PREV_TX))
+  # Find the oldest valid point for our 3-second SMA window
+  oldest_rx=$RX
+  oldest_tx=$TX
+  span=0
 
-  [ "$RX_DIFF" -lt 0 ] && RX_DIFF=0
-  [ "$TX_DIFF" -lt 0 ] && TX_DIFF=0
+  if [[ "$p_rx3" =~ ^[0-9]+$ ]]; then
+    oldest_rx=$p_rx3
+    oldest_tx=$p_tx3
+    span=3
+  elif [[ "$p_rx2" =~ ^[0-9]+$ ]]; then
+    oldest_rx=$p_rx2
+    oldest_tx=$p_tx2
+    span=2
+  elif [[ "$p_rx1" =~ ^[0-9]+$ ]]; then
+    oldest_rx=$p_rx1
+    oldest_tx=$p_tx1
+    span=1
+  fi
+
+  # Calculate Speeds (Average over the span)
+  if [ "$span" -eq 0 ]; then
+    RX_SPEED=0
+    TX_SPEED=0
+  else
+    RX_SPEED=$(( (RX - oldest_rx) / span ))
+    TX_SPEED=$(( (TX - oldest_tx) / span ))
+  fi
+
+  [ "$RX_SPEED" -lt 0 ] && RX_SPEED=0
+  [ "$TX_SPEED" -lt 0 ] && TX_SPEED=0
 
   # Append to the new state buffer to write to disk later
-  NEW_STATE_BUFFER+="$netns $device $RX $TX\n"
+  # We shift the history to the right, using '-' as a placeholder if a value is missing
+  NEW_STATE_BUFFER+="$netns $device $RX $TX ${p_rx1:--} ${p_tx1:--} ${p_rx2:--} ${p_tx2:--}\n"
 
-  # Add raw bytes to global totals
-  TOTAL_RX_B=$((TOTAL_RX_B + RX_DIFF))
-  TOTAL_TX_B=$((TOTAL_TX_B + TX_DIFF))
+  # Exclude VPN devices to prevent double-counting encapsulated traffic
+  if [[ "$device" != wg* ]] && [[ "$device" != tun* ]] && [[ "$device" != tap* ]]; then
+    TOTAL_RX_B=$((TOTAL_RX_B + RX_SPEED))
+    TOTAL_TX_B=$((TOTAL_TX_B + TX_SPEED))
+  fi
 
   # Format individual speeds directly into variables
-  format_speed "$RX_DIFF" FMT_RX_SPEED
-  format_speed "$TX_DIFF" FMT_TX_SPEED
+  format_speed "$RX_SPEED" FMT_RX_SPEED
+  format_speed "$TX_SPEED" FMT_TX_SPEED
 
   case "$device" in
     wg*|tun*|tap*) ICON="🔒" ;;  # WireGuard / VPN

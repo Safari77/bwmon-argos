@@ -32,7 +32,7 @@ Monitoring interfaces inside network namespaces requires root privileges, but de
 * **Shared Data:** /run/bwmon.state
   * Written by the root publisher, read by the desktop user. Contains the raw byte counts for the current second.
 * **User Delta State:** /run/user/\<UID\>/bwmon/
-  * Maintained entirely by the unprivileged Argos script. Stores the previous second's byte counts to calculate KB/s and MB/s.
+  * Maintained entirely by the unprivileged Argos script. Stores the previous three seconds' byte counts to calculate simple moving average.
 
 ### **4\. GNOME Argos Script**
 
@@ -63,6 +63,7 @@ vpn2 wg1
 ```
 
 *In this example, eth2 and wlp2s0 are read from the host network, while wg0 and wg1 are read from their respective isolated namespaces.*
+Network usage of VPN devices is not added into the totals to avoid double-counting.
 
 ## **Installation and Setup**
 

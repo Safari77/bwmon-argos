@@ -49,7 +49,6 @@ ProtectKernelLogs=yes
 PrivateDevices=yes
 IPAddressDeny=any
 ProtectProc=invisible
-RestrictNamespaces=mnt net
 
 [Install]
 WantedBy=multi-user.target
