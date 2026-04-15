@@ -29,8 +29,8 @@ LockPersonality=yes
 RestrictSUIDSGID=yes
 
 # 4. Capability Bounding (Whitelist)
-# Drop all capabilities except the one required to switch network namespaces
-CapabilityBoundingSet=CAP_SYS_ADMIN
+# CAP_SYS_ADMIN is required for setns(), CAP_SYS_PTRACE is required to open the nsfs file.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE
 AmbientCapabilities=
 
 # 5. Address Family Restriction
