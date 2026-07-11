@@ -37,6 +37,24 @@ format_speed() {
   printf -v "$out_var" "%s" "$result"
 }
 
+format_bytes() {
+  local bytes=$1
+  local out_var=$2
+  local result
+
+  if [ "$bytes" -lt 1048576 ]; then
+    result="$(( bytes / 1024 )) KiB"
+  elif [ "$bytes" -lt 1073741824 ]; then
+    result="$(( bytes / 1048576 )).$(( (bytes % 1048576) * 10 / 1048576 )) MiB"
+  elif [ "$bytes" -lt 1099511627776 ]; then
+    result="$(( bytes / 1073741824 )).$(( (bytes % 1073741824) * 10 / 1073741824 )) GiB"
+  else
+    result="$(( bytes / 1099511627776 )).$(( (bytes % 1099511627776) * 10 / 1099511627776 )) TiB"
+  fi
+
+  printf -v "$out_var" "%s" "$result"
+}
+
 # Load all previous states into memory at once
 declare -A PREV_MAP
 if [[ -r "$STATE_FILE" ]]; then
@@ -106,6 +124,10 @@ while read -r netns device RX TX; do
   format_speed "$RX_SPEED" FMT_RX_SPEED
   format_speed "$TX_SPEED" FMT_TX_SPEED
 
+  # Format cumulative counters (auto-scales KiB/MiB/GiB/TiB)
+  format_bytes "$RX" FMT_RX_TOTAL
+  format_bytes "$TX" FMT_TX_TOTAL
+
   case "$device" in
     wg*|tun*|tap*) ICON="🔒" ;;  # WireGuard / VPN
     en*|eth*)      ICON="🔌" ;;  # Ethernet
@@ -117,7 +139,7 @@ while read -r netns device RX TX; do
   INDENT="&#160;&#160;&#160;&#160;"
   DROPDOWN_OUTPUT+="<span>$ICON [$netns] <b>$device</b></span> | useMarkup=true\n"
   DROPDOWN_OUTPUT+="${INDENT}<span font_family='monospace'>↓ ${FMT_RX_SPEED}  ↑ ${FMT_TX_SPEED}</span> | useMarkup=true\n"
-  DROPDOWN_OUTPUT+="${INDENT}<span font_family='monospace'>RX: $((RX / 1048576)) MiB  TX: $((TX / 1048576)) MiB</span> | useMarkup=true\n"
+  DROPDOWN_OUTPUT+="${INDENT}<span font_family='monospace'>RX: ${FMT_RX_TOTAL}  TX: ${FMT_TX_TOTAL}</span> | useMarkup=true\n"
 
 done < "$RUN_FILE"
 
