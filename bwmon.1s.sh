@@ -22,9 +22,17 @@ DROPDOWN_OUTPUT=""
 NEW_STATE_BUFFER=""
 
 format_3sigfig() {
-  local bytes=$1
+  local bytes=${1:-0}
   local out_var=$2
   local suffix=$3
+
+  # Direct byte formatting for <= 999 bytes (e.g. 0 B, 45 B, 999 B/s)
+  if [ "$bytes" -le 999 ]; then
+    [ "$bytes" -lt 0 ] && bytes=0
+    printf -v "$out_var" "%d B%s" "$bytes" "$suffix"
+    return
+  fi
+
   local u_val u_name
 
   if [ "$bytes" -lt 1048576 ]; then
@@ -39,11 +47,6 @@ format_3sigfig() {
   else
     u_val=1099511627776
     u_name="TiB"
-  fi
-
-  if [ "$bytes" -le 0 ]; then
-    printf -v "$out_var" "0 %s%s" "$u_name" "$suffix"
-    return
   fi
 
   local int=$(( bytes / u_val ))
