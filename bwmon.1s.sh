@@ -21,38 +21,71 @@ TOTAL_TX_B=0
 DROPDOWN_OUTPUT=""
 NEW_STATE_BUFFER=""
 
-format_speed() {
+format_3sigfig() {
   local bytes=$1
   local out_var=$2
-  local result
+  local suffix=$3
+  local u_val u_name
 
   if [ "$bytes" -lt 1048576 ]; then
-    result="$(( bytes / 1024 )) KiB/s"
+    u_val=1024
+    u_name="KiB"
   elif [ "$bytes" -lt 1073741824 ]; then
-    result="$(( bytes / 1048576 )).$(( (bytes % 1048576) * 10 / 1048576 )) MiB/s"
+    u_val=1048576
+    u_name="MiB"
+  elif [ "$bytes" -lt 1099511627776 ]; then
+    u_val=1073741824
+    u_name="GiB"
   else
-    result="$(( bytes / 1073741824 )).$(( (bytes % 1073741824) * 10 / 1073741824 )) GiB/s"
+    u_val=1099511627776
+    u_name="TiB"
   fi
 
-  printf -v "$out_var" "%s" "$result"
+  if [ "$bytes" -le 0 ]; then
+    printf -v "$out_var" "0 %s%s" "$u_name" "$suffix"
+    return
+  fi
+
+  local int=$(( bytes / u_val ))
+  local rem=$(( bytes % u_val ))
+
+  if [ "$int" -lt 10 ]; then
+    # 1 integer digit -> 2 decimal places (e.g. 1.45 TiB)
+    local frac=$(( (rem * 100 + u_val / 2) / u_val ))
+    if [ "$frac" -ge 100 ]; then
+      int=$(( int + 1 ))
+      frac=0
+    fi
+    if [ "$int" -ge 10 ]; then
+      printf -v "$out_var" "%d.%d %s%s" "$int" "$(( frac / 10 ))" "$u_name" "$suffix"
+    else
+      printf -v "$out_var" "%d.%02d %s%s" "$int" "$frac" "$u_name" "$suffix"
+    fi
+  elif [ "$int" -lt 100 ]; then
+    # 2 integer digits -> 1 decimal place (e.g. 14.5 TiB)
+    local frac=$(( (rem * 10 + u_val / 2) / u_val ))
+    if [ "$frac" -ge 10 ]; then
+      int=$(( int + 1 ))
+      frac=0
+    fi
+    if [ "$int" -ge 100 ]; then
+      printf -v "$out_var" "%d %s%s" "$int" "$u_name" "$suffix"
+    else
+      printf -v "$out_var" "%d.%d %s%s" "$int" "$frac" "$u_name" "$suffix"
+    fi
+  else
+    # 3+ integer digits -> 0 decimal places (e.g. 145 TiB)
+    local rounded=$(( (bytes + u_val / 2) / u_val ))
+    printf -v "$out_var" "%d %s%s" "$rounded" "$u_name" "$suffix"
+  fi
+}
+
+format_speed() {
+  format_3sigfig "$1" "$2" "/s"
 }
 
 format_bytes() {
-  local bytes=$1
-  local out_var=$2
-  local result
-
-  if [ "$bytes" -lt 1048576 ]; then
-    result="$(( bytes / 1024 )) KiB"
-  elif [ "$bytes" -lt 1073741824 ]; then
-    result="$(( bytes / 1048576 )).$(( (bytes % 1048576) * 10 / 1048576 )) MiB"
-  elif [ "$bytes" -lt 1099511627776 ]; then
-    result="$(( bytes / 1073741824 )).$(( (bytes % 1073741824) * 10 / 1073741824 )) GiB"
-  else
-    result="$(( bytes / 1099511627776 )).$(( (bytes % 1099511627776) * 10 / 1099511627776 )) TiB"
-  fi
-
-  printf -v "$out_var" "%s" "$result"
+  format_3sigfig "$1" "$2" ""
 }
 
 # Load all previous states into memory at once
