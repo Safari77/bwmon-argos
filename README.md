@@ -13,6 +13,12 @@ Monitoring interfaces inside network namespaces requires root privileges, but de
 1. **The Publisher (Root)**: A heavily sandboxed systemd service runs a pure Bash script in the background. It reads byte counts directly from the kernel (`/sys/class/net/`), transitions into configured network namespaces, and performs an atomic write to a shared memory file (tmpfs).
 2. **The Frontend (User)**: A lightweight Bash script executed by the Argos GNOME extension reads the shared memory file, calculates the speed diffs, and formats the output for the top panel.
 
+## **Prerequisites**
+
+* **GNOME Shell** with the **Argos** extension installed and enabled.
+* **iproute2** (`ip netns` support).
+* **bash** and standard coreutils (`cat`, `install`).
+
 ## **Files and Directories**
 
 ### **1\. Configuration File**
@@ -37,7 +43,7 @@ Monitoring interfaces inside network namespaces requires root privileges, but de
 ### **4\. GNOME Argos Script**
 
 * **Path:** ~/.config/argos/bwmon.1s.sh
-* **Purpose:** The UI renderer. It reads `/run/bwmon.state`, formats the speeds with dynamic unit scaling (KiB/s, MiB/s, GiB/s), and outputs Pango-compatible text for GNOME Shell.
+* **Purpose:** The UI renderer. It reads `/run/bwmon.state`, formats the speeds with dynamic unit scaling (B/s, KiB/s, MiB/s, GiB/s, TiB/s), and outputs Pango-compatible text for GNOME Shell.
 
 ## **Configuration Guide**
 
@@ -70,7 +76,7 @@ Network usage of VPN devices is not added into the totals to avoid double-counti
 1. **Create the configuration file:**
 Populate `/etc/bwmon-devices` with your target interfaces.
 ```bash
-vim /etc/bwmon-devices
+sudoedit /etc/bwmon-devices
 ```
 
 2. **Install the Publisher Script:**
@@ -86,16 +92,18 @@ sudo systemctl enable --now bwmon-publisher.service
 ```
 
 4. **Install the Argos Frontend:**
-   Place bwmon-combined.1s.sh into your Argos configuration directory and make it executable:
+   Install bwmon.1s.sh into your Argos configuration directory:
 ```bash
-chmod +x ~/.config/argos/bwmon-combined.1s.sh
+mkdir -p ~/.config/argos/ && install bwmon.1s.sh ~/.config/argos/
 ```
 
 ## **Security and Sandboxing Notes**
 
 The bwmon-publisher.service is locked down using systemd's security features. If you experience crashes (Core Dumps) with a SIGSYS error, it means the script attempted a system call blocked by the Seccomp filter.
+
 By design, the service is only allowed:
 
 * `CAP_SYS_ADMIN` (Required for `setns()` to enter network namespaces).
-* `@mount` system calls (Required by `ip netns exec` to set up the namespace environment).
-* Read-only access to the host OS, with write access explicitly limited to `/run`.
+* `CAP_SYS_PTRACE` required by the kernel to open `/proc/$PID/ns/net` or nsfs mounts when executing `ip netns exec`.
+* Seccomp Filtering: Restricts hazardous syscall categories (`@clock`, `@module`, `@raw-io`, `@reboot`, etc.) while keeping `@mount` unblocked for namespace transitions.
+* Filesystem & IPC: Enforces `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, and restricts write access strictly to `/run`. Network socket creation is limited to `AF_UNIX` and `AF_NETLINK`.
