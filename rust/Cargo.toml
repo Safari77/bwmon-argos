@@ -1,0 +1,19 @@
+[package]
+name = "bwmon-publisher"
+version = "0.5.0"
+edition = "2024"
+description = "Publish per-namespace network device byte counters to a state file (rewrite of bwmon-publisher.sh)"
+license = "MIT"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+libc = "0.2"
+rkyv = "0.8"
+signal-hook = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

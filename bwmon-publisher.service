@@ -3,9 +3,10 @@ Description=Bandwidth Monitor Publisher
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/bwmon-publisher.sh
+Type=notify
+ExecStart=/usr/local/bin/bwmon-publisher
 Restart=always
+RestartSec=2
 User=root
 
 # 1. Filesystem Isolation

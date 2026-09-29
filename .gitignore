@@ -1,2 +1,4 @@
 *~
 .*.sw?
+/rust/target/
+/rust/Cargo.lock
