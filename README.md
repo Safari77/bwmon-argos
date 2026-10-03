@@ -107,3 +107,8 @@ By design, the service is only allowed:
 * `CAP_SYS_PTRACE` required by the kernel to open `/proc/$PID/ns/net` or nsfs mounts when executing `ip netns exec`.
 * Seccomp Filtering: Restricts hazardous syscall categories (`@clock`, `@module`, `@raw-io`, `@reboot`, etc.) while keeping `@mount` unblocked for namespace transitions.
 * Filesystem & IPC: Enforces `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, and restricts write access strictly to `/run`. Network socket creation is limited to `AF_UNIX` and `AF_NETLINK`.
+
+## **The first start of bwmon-publisher after boot**
+
+Seems it gets `EACCESS` when trying to open the fd for (non-root) network namespace.
+Just restart the service after all the namespaces have been created.
