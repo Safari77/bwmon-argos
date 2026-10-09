@@ -3,6 +3,14 @@
 RUN_FILE="/run/bwmon.state"
 STATE_DIR="/run/user/$UID/bwmon"
 STATE_FILE="${STATE_DIR}/bwmon.state"
+SMA_WINDOW="${SMA_WINDOW:-4}"
+
+# Validate SMA_WINDOW is a positive integer, fallback to 4
+# Keep as a multiple of bwmon-publisher's interval setting
+# to avoid oscillations in calculations
+if [[ ! "$SMA_WINDOW" =~ ^[0-9]+$ ]] || [ "$SMA_WINDOW" -lt 1 ]; then
+  SMA_WINDOW=4
+fi
 
 # Ensure our user-specific state directory exists
 if [[ ! -d "$STATE_DIR" ]]; then
@@ -94,7 +102,7 @@ format_bytes() {
 # Load all previous states into memory at once
 declare -A PREV_MAP
 if [[ -r "$STATE_FILE" ]]; then
-  # State format: netns device rx1 tx1 rx2 tx2 rx3 tx3
+  # State format: netns device rx1 tx1 rx2 tx2 ... rxN txN
   while read -r p_netns p_device p_hist; do
     PREV_MAP["${p_netns}_${p_device}"]="$p_hist"
   done < "$STATE_FILE"
@@ -112,27 +120,24 @@ while read -r netns device RX TX; do
   KEY="${netns}_${device}"
 
   # Retrieve previous state from memory
-  # p_hist contains: rx1 tx1 rx2 tx2 rx3 tx3 (1 is 1 sec ago, 2 is 2 secs ago...)
-  read -r p_rx1 p_tx1 p_rx2 p_tx2 p_rx3 p_tx3 <<< "${PREV_MAP[$KEY]}"
+  # p_hist contains: rx1 tx1 rx2 tx2 ... rxN txN (1 is 1 sec ago, 2 is 2 secs ago...)
+  read -r -a hist_arr <<< "${PREV_MAP[$KEY]}"
 
-  # Find the oldest valid point for our 3-second SMA window
+  # Find the oldest valid point for our SMA window
   oldest_rx=$RX
   oldest_tx=$TX
   span=0
 
-  if [[ "$p_rx3" =~ ^[0-9]+$ ]]; then
-    oldest_rx=$p_rx3
-    oldest_tx=$p_tx3
-    span=3
-  elif [[ "$p_rx2" =~ ^[0-9]+$ ]]; then
-    oldest_rx=$p_rx2
-    oldest_tx=$p_tx2
-    span=2
-  elif [[ "$p_rx1" =~ ^[0-9]+$ ]]; then
-    oldest_rx=$p_rx1
-    oldest_tx=$p_tx1
-    span=1
-  fi
+  for ((w = SMA_WINDOW; w >= 1; w--)); do
+    idx_rx=$(( (w - 1) * 2 ))
+    idx_tx=$(( idx_rx + 1 ))
+    if [[ "${hist_arr[idx_rx]}" =~ ^[0-9]+$ ]] && [[ "${hist_arr[idx_tx]}" =~ ^[0-9]+$ ]]; then
+      oldest_rx=${hist_arr[idx_rx]}
+      oldest_tx=${hist_arr[idx_tx]}
+      span=$w
+      break
+    fi
+  done
 
   # Calculate Speeds (Average over the span)
   if [ "$span" -eq 0 ]; then
@@ -148,7 +153,11 @@ while read -r netns device RX TX; do
 
   # Append to the new state buffer to write to disk later
   # We shift the history to the right, using '-' as a placeholder if a value is missing
-  NEW_STATE_BUFFER+="$netns $device $RX $TX ${p_rx1:--} ${p_tx1:--} ${p_rx2:--} ${p_tx2:--}\n"
+  new_hist=("$RX" "$TX")
+  for ((i = 0; i < (SMA_WINDOW - 1) * 2; i += 2)); do
+    new_hist+=("${hist_arr[i]:--}" "${hist_arr[i+1]:--}")
+  done
+  NEW_STATE_BUFFER+="$netns $device ${new_hist[*]}\n"
 
   # Exclude VPN devices to prevent double-counting encapsulated traffic
   if [[ "$device" != wg* ]] && [[ "$device" != tun* ]] && [[ "$device" != tap* ]]; then
