@@ -1,15 +1,30 @@
 use clap::Parser;
-use rkyv::{Archive, Deserialize, Serialize, rancor::Error};
+use rkyv::{Archive, Deserialize, Serialize, rancor::Error, util::AlignedVec};
+#[cfg(target_os = "linux")]
+use rustix::fd::AsFd;
+use rustix::fd::{AsRawFd, OwnedFd, RawFd};
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
+use rustix::net::{
+    AddressFamily, SendFlags, SocketAddrUnix, SocketFlags, SocketType, connect_unix, send,
+    socket_with,
+};
+use rustix::process::{Pid, Signal, WaitOptions, getpid, getppid, kill_process, waitpid};
+#[cfg(target_os = "linux")]
+use rustix::process::{
+    PidfdFlags, WaitId, WaitidOptions, pidfd_open, pidfd_send_signal,
+    set_parent_process_death_signal, waitid,
+};
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+const MAX_IPC_FRAME_LEN: usize = 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,6 +74,7 @@ pub struct DeviceStat {
 fn is_valid_identifier(name: &str) -> bool {
     !name.is_empty()
         && name != "-"
+        && name != "."
         && name.len() <= 64
         && !name.contains('/')
         && !name.contains('\0')
@@ -112,6 +128,18 @@ fn parse_config(path: &Path, verbose: bool) -> std::io::Result<Vec<DeviceEntry>>
             }
         };
 
+        if netns != "-" && !is_valid_identifier(netns) {
+            if verbose {
+                eprintln!(
+                    "Warning: invalid network namespace '{}' at {}:{}, skipping",
+                    netns,
+                    path.display(),
+                    line_num + 1
+                );
+            }
+            continue;
+        }
+
         if !is_valid_identifier(iface) {
             if verbose {
                 eprintln!(
@@ -164,36 +192,59 @@ fn read_device_stats(iface: &str) -> (u64, u64) {
 
 /// Writes a framed byte payload (4-byte length prefix + payload) in a single contiguous write/sendto syscall.
 fn send_framed_bytes(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
-    let len = (payload.len() as u32).to_le_bytes();
+    let len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "payload too large"))?
+        .to_le_bytes();
     let mut packet = Vec::with_capacity(4 + payload.len());
     packet.extend_from_slice(&len);
     packet.extend_from_slice(payload);
     stream.write_all(&packet)
 }
 
-/// Reads a framed byte payload from the stream.
-fn recv_framed_bytes(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+/// Reads a framed byte payload from the stream into a 16-byte aligned buffer required by rkyv.
+fn recv_framed_bytes(stream: &mut UnixStream) -> std::io::Result<AlignedVec> {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes)?;
     let len = u32::from_le_bytes(len_bytes) as usize;
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
+    if len > MAX_IPC_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPC frame exceeds maximum allowed size",
+        ));
+    }
+    let mut buf = AlignedVec::with_capacity(len);
+    buf.resize(len, 0);
+    stream.read_exact(buf.as_mut_slice())?;
     Ok(buf)
+}
+
+/// Forcefully kills and reaps a child process using pidfd on Linux (avoiding PID recycling races)
+/// or portable rustix kill_process/waitpid across other UNIX systems, retrying if interrupted (EINTR).
+fn kill_and_reap(pid: Pid, #[cfg(target_os = "linux")] pidfd: Option<OwnedFd>) {
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = pidfd {
+        let _ = pidfd_send_signal(&fd, Signal::Kill);
+        while let Err(Errno::INTR) = waitid(WaitId::PidFd(fd.as_fd()), WaitidOptions::EXITED) {}
+        return;
+    }
+
+    let _ = kill_process(pid, Signal::Kill);
+    while let Err(Errno::INTR) = waitpid(Some(pid), WaitOptions::empty()) {}
+}
+
+/// Returns the (st_dev, st_ino) identity of `/run/netns/<netns>` if it currently exists.
+fn stat_netns(netns: &str) -> Option<(u64, u64)> {
+    if !is_valid_identifier(netns) {
+        return None;
+    }
+    let path_str = format!("/run/netns/{}", netns);
+    let st = rustix::fs::stat(path_str.as_str()).ok()?;
+    Some((st.st_dev as u64, st.st_ino as u64))
 }
 
 /// Native systemd service notification helper implementing the sd_notify protocol.
 pub struct SystemdNotifier {
-    fd: Option<libc::c_int>,
-}
-
-impl Drop for SystemdNotifier {
-    fn drop(&mut self) {
-        if let Some(fd) = self.fd {
-            unsafe {
-                libc::close(fd);
-            }
-        }
-    }
+    fd: Option<OwnedFd>,
 }
 
 impl Default for SystemdNotifier {
@@ -209,63 +260,36 @@ impl SystemdNotifier {
             _ => return Self { fd: None },
         };
 
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-        if fd < 0 {
+        let Ok(fd) =
+            socket_with(AddressFamily::UNIX, SocketType::DGRAM, SocketFlags::CLOEXEC, None)
+        else {
             return Self { fd: None };
-        }
-
-        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        };
 
         let bytes = socket_env.as_bytes();
-        let (path_bytes, is_abstract) = if let Some(stripped) = bytes.strip_prefix(b"@") {
-            (stripped, true)
-        } else {
-            (bytes, false)
-        };
-
         // Ensure path fits inside sun_path (leaving space for leading null if abstract, or trailing null if path)
-        if path_bytes.len() >= addr.sun_path.len() {
-            unsafe {
-                libc::close(fd);
-            }
-            return Self { fd: None };
-        }
-
-        let base_ptr = addr.sun_path.as_mut_ptr() as *mut u8;
-        let addr_len = if is_abstract {
+        let addr = if let Some(stripped) = bytes.strip_prefix(b"@") {
             // In Linux abstract namespace, sun_path starts with a null byte followed by the socket name
-            unsafe {
-                *base_ptr = 0;
-                std::ptr::copy_nonoverlapping(
-                    path_bytes.as_ptr(),
-                    base_ptr.add(1),
-                    path_bytes.len(),
-                );
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                let Ok(a) = SocketAddrUnix::new_abstract_name(stripped) else {
+                    return Self { fd: None };
+                };
+                a
             }
-            let sun_path_offset = (addr.sun_path.as_ptr() as usize) - (&addr as *const _ as usize);
-            sun_path_offset + 1 + path_bytes.len()
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                let _ = stripped;
+                return Self { fd: None };
+            }
         } else {
-            unsafe {
-                std::ptr::copy_nonoverlapping(path_bytes.as_ptr(), base_ptr, path_bytes.len());
-                *base_ptr.add(path_bytes.len()) = 0;
-            }
-            let sun_path_offset = (addr.sun_path.as_ptr() as usize) - (&addr as *const _ as usize);
-            sun_path_offset + path_bytes.len() + 1
+            let Ok(a) = SocketAddrUnix::new(socket_env.as_str()) else {
+                return Self { fd: None };
+            };
+            a
         };
 
-        let ret = unsafe {
-            libc::connect(
-                fd,
-                &addr as *const _ as *const libc::sockaddr,
-                addr_len as libc::socklen_t,
-            )
-        };
-
-        if ret != 0 {
-            unsafe {
-                libc::close(fd);
-            }
+        if connect_unix(&fd, &addr).is_err() {
             return Self { fd: None };
         }
 
@@ -273,15 +297,13 @@ impl SystemdNotifier {
     }
 
     pub fn notify(&self, state: &str) {
-        if let Some(fd) = self.fd {
-            unsafe {
-                libc::send(
-                    fd,
-                    state.as_ptr() as *const libc::c_void,
-                    state.len(),
-                    libc::MSG_NOSIGNAL,
-                );
-            }
+        if let Some(ref fd) = self.fd {
+            #[cfg(not(target_vendor = "apple"))]
+            let flags = SendFlags::NOSIGNAL;
+            #[cfg(target_vendor = "apple")]
+            let flags = SendFlags::empty();
+
+            let _ = send(fd, state.as_bytes(), flags);
         }
     }
 
@@ -295,28 +317,106 @@ impl SystemdNotifier {
 
     /// Raw fd of the notify socket, so forked worker children can
     /// close their inherited copy.
-    pub fn raw_fd(&self) -> Option<libc::c_int> {
-        self.fd
+    pub fn raw_fd(&self) -> Option<RawFd> {
+        self.fd.as_ref().map(|fd| fd.as_raw_fd())
     }
 }
 
 /// Long-lived worker process tracking an active network namespace
 struct NetnsWorker {
-    pid: libc::pid_t,
+    /// Some(pid) while child is un-reaped; None if already reaped via waitid/waitpid(WNOHANG)
+    pid: Option<Pid>,
+    /// Process file descriptor on Linux for race-free signaling and reaping
+    #[cfg(target_os = "linux")]
+    pidfd: Option<OwnedFd>,
     stream: UnixStream,
+    ns_dev: u64,
+    ns_ino: u64,
+}
+
+impl NetnsWorker {
+    /// Checks if the child worker has exited without blocking.
+    /// If exited, marks `self.pid = None` (and drops `pidfd` on Linux) so `Drop` will not kill/wait a recycled PID.
+    fn has_exited(&mut self) -> Option<Pid> {
+        let pid = self.pid?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(ref pidfd) = self.pidfd {
+            loop {
+                match waitid(
+                    WaitId::PidFd(pidfd.as_fd()),
+                    WaitidOptions::EXITED | WaitidOptions::NOHANG,
+                ) {
+                    Ok(None) => return None,
+                    Ok(Some(_)) => {
+                        self.pid = None;
+                        self.pidfd = None;
+                        return Some(pid);
+                    }
+                    Err(Errno::INTR) => continue,
+                    Err(_) => {
+                        // ECHILD or unexpected error: child no longer exists
+                        self.pid = None;
+                        self.pidfd = None;
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+
+        loop {
+            match waitpid(Some(pid), WaitOptions::NOHANG) {
+                Ok(None) => return None,
+                Ok(Some(_)) => {
+                    self.pid = None;
+                    return Some(pid);
+                }
+                Err(Errno::INTR) => continue,
+                Err(_) => {
+                    // ECHILD or unexpected error: child no longer exists
+                    self.pid = None;
+                    return Some(pid);
+                }
+            }
+        }
+    }
 }
 
 impl Drop for NetnsWorker {
     fn drop(&mut self) {
-        // Close communication channel and reap child process immediately
+        // Close communication channel and reap child process immediately if still running
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
-        unsafe {
-            // Guarantee instantaneous termination so waitpid never blocks deactivation
-            libc::kill(self.pid, libc::SIGKILL);
-            let mut status = 0;
-            libc::waitpid(self.pid, &mut status, 0);
+        if let Some(pid) = self.pid.take() {
+            // Guarantee instantaneous termination so waitid/waitpid never blocks deactivation
+            kill_and_reap(
+                pid,
+                #[cfg(target_os = "linux")]
+                self.pidfd.take(),
+            );
         }
     }
+}
+
+/// Reaps any workers whose child process was killed or terminated, removing them from the map.
+/// Returns the number of dead workers removed.
+fn reap_dead_workers(workers: &mut HashMap<String, NetnsWorker>, verbose: bool) -> usize {
+    let mut removed = 0;
+    workers.retain(|ns, worker| {
+        if let Some(dead_pid) = worker.has_exited() {
+            if verbose {
+                eprintln!(
+                    "Warning: worker for namespace '{}' (pid {}) terminated unexpectedly",
+                    ns,
+                    dead_pid.as_raw_nonzero()
+                );
+            }
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    removed
 }
 
 /// Event loop executed by the persistent forked child worker inside the target network namespace.
@@ -355,36 +455,35 @@ fn child_worker_loop(mut stream: UnixStream) {
 fn spawn_netns_worker(
     netns: &str,
     existing_workers: &HashMap<String, NetnsWorker>,
-    notify_fd: Option<libc::c_int>,
+    notify_fd: Option<RawFd>,
+    verbose: bool,
 ) -> Option<NetnsWorker> {
-    // Only check standard /run/netns/<netns>
-    let path_str = format!("/run/netns/{}", netns);
-    let ns_path = CString::new(path_str).ok()?;
-    let ns_fd = unsafe { libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if ns_fd < 0 {
-        // Namespace cannot be opened: do not error out or write anything
+    if !is_valid_identifier(netns) {
         return None;
     }
 
-    let (mut parent_stream, child_stream) = match UnixStream::pair() {
-        Ok(p) => p,
-        Err(_) => {
-            unsafe { libc::close(ns_fd) };
-            return None;
-        }
+    // Only check standard /run/netns/<netns>
+    let path_str = format!("/run/netns/{}", netns);
+    let Ok(ns_fd) =
+        rustix::fs::open(path_str.as_str(), OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+    else {
+        // Namespace cannot be opened: do not error out or write anything
+        return None;
     };
+
+    let ns_stat = rustix::fs::fstat(&ns_fd).ok()?;
+
+    let (parent_stream, child_stream) = UnixStream::pair().ok()?;
     let _ = parent_stream.set_read_timeout(Some(Duration::from_millis(500)));
     let _ = parent_stream.set_write_timeout(Some(Duration::from_millis(500)));
 
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        unsafe {
-            libc::close(ns_fd);
-        }
+    let parent_pid = getpid();
+    let raw_pid = unsafe { libc::fork() };
+    if raw_pid < 0 {
         return None;
     }
 
-    if pid == 0 {
+    if raw_pid == 0 {
         // Child worker process
         drop(parent_stream);
 
@@ -393,6 +492,7 @@ fn spawn_netns_worker(
             // Prevents child from inheriting parent's signal-hook handlers which catch SIGTERM.
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
             libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGCHLD, libc::SIG_DFL);
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
 
             // close the systemd notify socket copied across fork.
@@ -405,71 +505,115 @@ fn spawn_netns_worker(
             // Close inherited sibling worker sockets so child does not hold active peer references
             for worker in existing_workers.values() {
                 libc::close(worker.stream.as_raw_fd());
+                #[cfg(target_os = "linux")]
+                if let Some(ref pidfd) = worker.pidfd {
+                    libc::close(pidfd.as_raw_fd());
+                }
             }
+        }
 
+        #[cfg(target_os = "linux")]
+        {
             // Terminate child if parent process exits unexpectedly
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            if set_parent_process_death_signal(Some(Signal::Term)).is_err()
+                || getppid() != Some(parent_pid)
+            {
+                drop(ns_fd);
+                unsafe {
+                    libc::_exit(1);
+                }
+            }
 
             // Switch to target network namespace
-            if libc::setns(ns_fd, libc::CLONE_NEWNET) != 0 {
-                libc::close(ns_fd);
-                libc::_exit(1);
+            if unsafe { libc::setns(ns_fd.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                drop(ns_fd);
+                unsafe {
+                    libc::_exit(1);
+                }
             }
-            libc::close(ns_fd);
+            drop(ns_fd);
 
             // Remount private /sys once at worker startup
-            let ok = libc::unshare(libc::CLONE_NEWNS) == 0
-                && libc::mount(
-                    c"none".as_ptr(),
-                    c"/".as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_REC | libc::MS_PRIVATE,
-                    std::ptr::null(),
-                ) == 0
-                && libc::mount(
-                    c"sysfs".as_ptr(),
-                    c"/sys".as_ptr(),
-                    c"sysfs".as_ptr(),
-                    0,
-                    std::ptr::null(),
-                ) == 0; // stacking over old /sys is fine
+            let ok = unsafe {
+                libc::unshare(libc::CLONE_NEWNS) == 0
+                    && libc::mount(
+                        c"none".as_ptr(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    ) == 0
+                    && libc::mount(
+                        c"sysfs".as_ptr(),
+                        c"/sys".as_ptr(),
+                        c"sysfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    ) == 0 // stacking over old /sys is fine
+            };
             if !ok {
-                libc::_exit(3);
+                unsafe {
+                    libc::_exit(3);
+                }
             } // parent's handshake read fails → namespace omitted
         }
 
-        // Notify parent that namespace was successfully entered and /sys remounted
-        let mut ready_stream = child_stream;
-        if ready_stream.write_all(b"O\n").is_err() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = parent_pid;
+            drop(ns_fd);
             unsafe {
-                libc::_exit(2);
+                libc::_exit(1);
             }
         }
 
-        child_worker_loop(ready_stream);
-        unsafe {
-            libc::_exit(0);
+        // Notify parent that namespace was successfully entered and /sys remounted
+        #[allow(unreachable_code)]
+        {
+            let mut ready_stream = child_stream;
+            if ready_stream.write_all(b"O\n").is_err() {
+                unsafe {
+                    libc::_exit(2);
+                }
+            }
+
+            child_worker_loop(ready_stream);
+            unsafe {
+                libc::_exit(0);
+            }
         }
     }
 
-    // Parent process closes child ns_fd
-    unsafe {
-        libc::close(ns_fd);
-    }
+    // Parent process closes child ns_fd and child stream
+    drop(ns_fd);
     drop(child_stream);
 
-    // Read initialization handshake from child
+    let pid = Pid::from_raw(raw_pid)?;
+
+    // Open a pidfd immediately while the child is still unreaped by the parent
+    #[cfg(target_os = "linux")]
+    let pidfd = pidfd_open(pid, PidfdFlags::empty()).ok();
+
+    let mut worker = NetnsWorker {
+        pid: Some(pid),
+        #[cfg(target_os = "linux")]
+        pidfd,
+        stream: parent_stream,
+        ns_dev: ns_stat.st_dev as u64,
+        ns_ino: ns_stat.st_ino as u64,
+    };
+
+    // Read initialization handshake from child (if this fails, dropping `worker` kills and reaps via pidfd)
     let mut ready_buf = [0u8; 2];
-    if parent_stream.read_exact(&mut ready_buf).is_err() || &ready_buf != b"O\n" {
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            let mut status = 0;
-            libc::waitpid(pid, &mut status, 0);
-        }
+    if worker.stream.read_exact(&mut ready_buf).is_err() || &ready_buf != b"O\n" {
         return None;
     }
 
-    Some(NetnsWorker { pid, stream: parent_stream })
+    if verbose {
+        eprintln!("Spawned worker (pid {}) for namespace '{}'", pid.as_raw_nonzero(), netns);
+    }
+
+    Some(worker)
 }
 
 /// Sends device queries to an existing persistent worker process over the IPC socket.
@@ -496,7 +640,10 @@ fn query_worker(
 /// Performs an atomic file write using tempfile in the destination directory,
 /// synchronizes buffers via fsync, and renames over the target path.
 fn write_atomic(outfile: &Path, content: &str) -> std::io::Result<()> {
-    let parent_dir = outfile.parent().unwrap_or_else(|| Path::new("."));
+    let parent_dir = match outfile.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
     if !parent_dir.exists() {
         std::fs::create_dir_all(parent_dir)?;
     }
@@ -506,7 +653,7 @@ fn write_atomic(outfile: &Path, content: &str) -> std::io::Result<()> {
 
     // Ensure permissions allow non-root status readers (e.g. Argos GNOME extension)
     let perms = std::fs::Permissions::from_mode(0o644);
-    let _ = temp.as_file().set_permissions(perms);
+    temp.as_file().set_permissions(perms)?;
 
     temp.write_all(content.as_bytes())?;
     temp.as_file().sync_all()?;
@@ -516,14 +663,16 @@ fn write_atomic(outfile: &Path, content: &str) -> std::io::Result<()> {
 }
 
 /// Collects counters across root and named namespaces, writing the state file atomically.
-/// Returns the number of currently active, monitored devices written to the state file.
+/// Returns the number of currently active, monitored devices written to the state file,
+/// or `Ok(None)` if interrupted by a termination signal before publishing.
 fn collect_and_publish(
     entries: &[DeviceEntry],
     workers: &mut HashMap<String, NetnsWorker>,
     outfile: &Path,
     term: &AtomicBool,
-    notify_fd: Option<libc::c_int>,
-) -> std::io::Result<usize> {
+    notify_fd: Option<RawFd>,
+    verbose: bool,
+) -> std::io::Result<Option<usize>> {
     // Group all devices by namespace: guarantees only ONE worker per unique namespace name
     let mut netns_groups: HashMap<String, Vec<String>> = HashMap::new();
     for entry in entries {
@@ -535,35 +684,75 @@ fn collect_and_publish(
         }
     }
 
+    // Reap any workers that terminated since the last tick
+    reap_dead_workers(workers, verbose);
+
     // Prune persistent workers for namespaces removed from the configuration
-    workers.retain(|ns, _| netns_groups.contains_key(ns));
+    // or namespaces that were deleted/recreated on the host (/run/netns/<ns> inode changed).
+    workers.retain(|ns, worker| {
+        if !netns_groups.contains_key(ns) {
+            return false;
+        }
+        match stat_netns(ns) {
+            Some((dev, ino)) if dev == worker.ns_dev && ino == worker.ns_ino => true,
+            _ => {
+                if verbose {
+                    eprintln!(
+                        "Notice: namespace '{}' was removed or recreated; dropping old worker",
+                        ns
+                    );
+                }
+                false
+            }
+        }
+    });
 
     // Specific namespace: query counters via persistent workers
     let mut netns_stats: HashMap<(String, String), (u64, u64)> = HashMap::new();
     let mut accessible_namespaces: HashSet<String> = HashSet::new();
 
-    // Query each namespace worker exactly once with its full list of devices
+    // Query each namespace worker, respawning immediately in the same tick if a worker died
     for (ns, devs) in &netns_groups {
         if term.load(Ordering::Relaxed) {
-            return Ok(0);
+            return Ok(None);
         }
 
-        if !workers.contains_key(ns)
-            && let Some(worker) = spawn_netns_worker(ns, workers, notify_fd)
-        {
-            workers.insert(ns.clone(), worker);
-        }
+        for attempt in 0..2 {
+            if !workers.contains_key(ns)
+                && let Some(worker) = spawn_netns_worker(ns, workers, notify_fd, verbose)
+            {
+                workers.insert(ns.clone(), worker);
+            }
 
-        if let Some(worker) = workers.get_mut(ns) {
+            let Some(worker) = workers.get_mut(ns) else {
+                break;
+            };
+
             match query_worker(worker, devs) {
                 Some(stats) => {
                     accessible_namespaces.insert(ns.clone());
                     for (dev, (rx, tx)) in stats {
                         netns_stats.insert((ns.clone(), dev), (rx, tx));
                     }
+                    break;
                 }
                 None => {
-                    // Worker crashed or communication failed: drop it so next tick can reinitialize
+                    // Worker crashed or was killed mid-query: reap/drop it and retry immediately
+                    let dead_pid = worker.has_exited().or(worker.pid);
+                    if verbose {
+                        if let Some(pid) = dead_pid {
+                            eprintln!(
+                                "Warning: worker for namespace '{}' (pid {}) failed or was killed; {}",
+                                ns,
+                                pid.as_raw_nonzero(),
+                                if attempt == 0 {
+                                    "respawning..."
+                                } else {
+                                    "giving up for this tick"
+                                }
+                            );
+                        }
+                    }
                     workers.remove(ns);
                 }
             }
@@ -596,7 +785,7 @@ fn collect_and_publish(
     // Atomic swap guarantees the Argos script never reads a half-written file
     write_atomic(outfile, &buffer)?;
 
-    Ok(monitored_count)
+    Ok(Some(monitored_count))
 }
 
 fn main() {
@@ -607,16 +796,22 @@ fn main() {
         std::process::exit(1);
     }
 
-    // flag::register sets the flag to true when SIGINT/SIGTERM is delivered
+    // flag::register sets the flag to true when SIGINT/SIGTERM/SIGCHLD is delivered
     let term = Arc::new(AtomicBool::new(false));
+    let sigchld = Arc::new(AtomicBool::new(false));
 
-    // Register async-signal-safe termination hooks
+    // Register async-signal-safe termination and child-exit hooks
     if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term)) {
         eprintln!("Failed to register SIGINT handler: {}", e);
         std::process::exit(1);
     }
     if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term)) {
         eprintln!("Failed to register SIGTERM handler: {}", e);
+        std::process::exit(1);
+    }
+    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGCHLD, Arc::clone(&sigchld))
+    {
+        eprintln!("Failed to register SIGCHLD handler: {}", e);
         std::process::exit(1);
     }
 
@@ -643,11 +838,19 @@ fn main() {
 
     while !term.load(Ordering::Relaxed) {
         let tick_start = Instant::now();
+        sigchld.store(false, Ordering::Relaxed);
 
         match parse_config(&cli.config, cli.verbose) {
             Ok(entries) => {
-                match collect_and_publish(&entries, &mut workers, &cli.outfile, &term, notify_fd) {
-                    Ok(count) => {
+                match collect_and_publish(
+                    &entries,
+                    &mut workers,
+                    &cli.outfile,
+                    &term,
+                    notify_fd,
+                    cli.verbose,
+                ) {
+                    Ok(Some(count)) => {
                         // Notify systemd when startup/first write finishes or when monitored device count changes
                         if !ready_sent {
                             notifier
@@ -659,6 +862,7 @@ fn main() {
                             last_reported_count = Some(count);
                         }
                     }
+                    Ok(None) => break,
                     Err(e) => {
                         if cli.verbose {
                             eprintln!("Error writing state file: {}", e);
@@ -677,12 +881,18 @@ fn main() {
             break;
         }
 
-        // Sleep remainder of interval, staying responsive to SIGINT/SIGTERM
+        // Sleep remainder of interval, staying responsive to SIGINT/SIGTERM and child exits (SIGCHLD)
         let elapsed = tick_start.elapsed();
         if elapsed < interval {
             let mut remaining = interval - elapsed;
             let sleep_step = Duration::from_millis(50);
             while remaining > Duration::ZERO && !term.load(Ordering::Relaxed) {
+                if sigchld.swap(false, Ordering::Relaxed)
+                    && reap_dead_workers(&mut workers, cli.verbose) > 0
+                {
+                    // Immediately run a collection tick to respawn the killed worker
+                    break;
+                }
                 let this_step = remaining.min(sleep_step);
                 std::thread::sleep(this_step);
                 remaining = remaining.saturating_sub(this_step);

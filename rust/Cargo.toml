@@ -11,6 +11,7 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 libc = "0.2"
 rkyv = "0.8"
+rustix = { version = "0.38", features = ["fs", "net", "process"] }
 signal-hook = "0.4"
 
 [profile.release]
