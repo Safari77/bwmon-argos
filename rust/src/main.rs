@@ -6,13 +6,12 @@ use rustix::fd::{AsRawFd, OwnedFd, RawFd};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 use rustix::net::{
-    AddressFamily, SendFlags, SocketAddrUnix, SocketFlags, SocketType, connect_unix, send,
-    socket_with,
+    AddressFamily, SendFlags, SocketAddrUnix, SocketFlags, SocketType, connect, send, socket_with,
 };
 use rustix::process::{Pid, Signal, WaitOptions, getpid, getppid, kill_process, waitpid};
 #[cfg(target_os = "linux")]
 use rustix::process::{
-    PidfdFlags, WaitId, WaitidOptions, pidfd_open, pidfd_send_signal,
+    PidfdFlags, WaitId, WaitIdOptions, pidfd_open, pidfd_send_signal,
     set_parent_process_death_signal, waitid,
 };
 use std::collections::{HashMap, HashSet};
@@ -84,7 +83,7 @@ fn is_valid_identifier(name: &str) -> bool {
 
 /// Parses the devices configuration file.
 /// Supports both "- <iface>" and "<iface>" for root namespace, as well as "<netns> <iface>".
-/// Automatically filters out duplicate namespace/device entries, preserving first-occurrence order.
+/// Filters duplicate entries and sorts root ("-") first, then applies natural/human ordering to netns and iface.
 fn parse_config(path: &Path, verbose: bool) -> std::io::Result<Vec<DeviceEntry>> {
     let content = std::fs::read_to_string(path)?;
     let mut entries = Vec::new();
@@ -168,6 +167,18 @@ fn parse_config(path: &Path, verbose: bool) -> std::io::Result<Vec<DeviceEntry>>
         }
     }
 
+    // Sort entries: root namespace ("-") first, then natural/human ordering for netns and iface
+    entries.sort_by(|a, b| {
+        let ns_cmp = match (a.netns.as_str(), b.netns.as_str()) {
+            ("-", "-") => std::cmp::Ordering::Equal,
+            ("-", _) => std::cmp::Ordering::Less,
+            (_, "-") => std::cmp::Ordering::Greater,
+            (ns_a, ns_b) => natord::compare(ns_a, ns_b),
+        };
+
+        ns_cmp.then_with(|| natord::compare(&a.iface, &b.iface))
+    });
+
     Ok(entries)
 }
 
@@ -223,12 +234,12 @@ fn recv_framed_bytes(stream: &mut UnixStream) -> std::io::Result<AlignedVec> {
 fn kill_and_reap(pid: Pid, #[cfg(target_os = "linux")] pidfd: Option<OwnedFd>) {
     #[cfg(target_os = "linux")]
     if let Some(fd) = pidfd {
-        let _ = pidfd_send_signal(&fd, Signal::Kill);
-        while let Err(Errno::INTR) = waitid(WaitId::PidFd(fd.as_fd()), WaitidOptions::EXITED) {}
+        let _ = pidfd_send_signal(&fd, Signal::KILL);
+        while let Err(Errno::INTR) = waitid(WaitId::PidFd(fd.as_fd()), WaitIdOptions::EXITED) {}
         return;
     }
 
-    let _ = kill_process(pid, Signal::Kill);
+    let _ = kill_process(pid, Signal::KILL);
     while let Err(Errno::INTR) = waitpid(Some(pid), WaitOptions::empty()) {}
 }
 
@@ -289,7 +300,7 @@ impl SystemdNotifier {
             a
         };
 
-        if connect_unix(&fd, &addr).is_err() {
+        if connect(&fd, &addr).is_err() {
             return Self { fd: None };
         }
 
@@ -345,7 +356,7 @@ impl NetnsWorker {
             loop {
                 match waitid(
                     WaitId::PidFd(pidfd.as_fd()),
-                    WaitidOptions::EXITED | WaitidOptions::NOHANG,
+                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG,
                 ) {
                     Ok(None) => return None,
                     Ok(Some(_)) => {
@@ -515,7 +526,7 @@ fn spawn_netns_worker(
         #[cfg(target_os = "linux")]
         {
             // Terminate child if parent process exits unexpectedly
-            if set_parent_process_death_signal(Some(Signal::Term)).is_err()
+            if set_parent_process_death_signal(Some(Signal::TERM)).is_err()
                 || getppid() != Some(parent_pid)
             {
                 drop(ns_fd);
@@ -739,8 +750,8 @@ fn collect_and_publish(
                 None => {
                     // Worker crashed or was killed mid-query: reap/drop it and retry immediately
                     let dead_pid = worker.has_exited().or(worker.pid);
-                    if verbose {
-                        if let Some(pid) = dead_pid {
+                    if verbose
+                        && let Some(pid) = dead_pid {
                             eprintln!(
                                 "Warning: worker for namespace '{}' (pid {}) failed or was killed; {}",
                                 ns,
@@ -752,7 +763,6 @@ fn collect_and_publish(
                                 }
                             );
                         }
-                    }
                     workers.remove(ns);
                 }
             }
